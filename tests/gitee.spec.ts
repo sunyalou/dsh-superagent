@@ -11,7 +11,7 @@ import { sourceContextOf, type SourceContextDeps } from '../src/app/source-conte
 import { apply as applyGitee, giteeKind, pollRound, type GiteeConfig } from '../src/sources/gitee.ts'
 import { giteeChannel, giteeRef, issueTrigger, mentions, noteTrigger, pullTrigger, threadIdOf,
   type GiteeNoteView, type GiteeTopic } from '../src/sources/gitee-trigger.ts'
-import { giteeThreadContext } from '../src/sources/gitee-read.ts'
+import { giteeThreadContext, giteeTime, giteeTimestamp } from '../src/sources/gitee-read.ts'
 import { sendGitee } from '../src/sources/gitee-channel.ts'
 import { feishuKind, feishuTrigger } from '../src/sources/feishu.ts'
 import { testDeployment } from './fixtures/deployment.ts'
@@ -83,8 +83,8 @@ function gitee(h: ReturnType<typeof host>, routes: Record<string, unknown>): str
   return reads
 }
 const feed = (list: readonly unknown[]) => (args: string[]) => args.includes('sort=desc') ? [list.at(-1)] : list
-const seed = (h: ReturnType<typeof host>, since: string, started = since): void =>
-  h.store.set(KV.gitee.events, { since, started: { issue: started, pull: started, comment: started } })
+const seed = (h: ReturnType<typeof host>, since: string, started = since, repository = REPO): void =>
+  h.store.set(KV.gitee.events, { repository, since, started: { issue: started, pull: started, comment: started } })
 const bodyOf = (h: ReturnType<typeof host>, call: string): unknown => {
   const found = vi.mocked(h.commands.run).mock.calls.find(([, args]) => `${args[0]} ${args[1]}` === call)
   if (!found) throw new Error(`No Gitee call ${call}`)
@@ -121,23 +121,23 @@ describe('Gitee triggers', () => {
   it('keeps the issue and pull request number spaces apart', () => {
     const issueTriggerValue = issueTrigger(topicOf('issue', 12), TARGET, 'agent')!
     const pullTriggerValue = pullTrigger(topicOf('pull', 12), TARGET, 'agent')!
-    expect(issueTriggerValue.id).toBe(key('gitee-issue', '12'))
-    expect(pullTriggerValue.id).toBe(key('gitee-pull', '12'))
+    expect(issueTriggerValue.id).toBe(key('gitee-issue', REPO, '12'))
+    expect(pullTriggerValue.id).toBe(key('gitee-pull', REPO, '12'))
     expect(issueTriggerValue.id).not.toBe(pullTriggerValue.id)
-    expect(issueTriggerValue.threads).toEqual([{ source: 'gitee', id: 'issue:12' }])
-    expect(pullTriggerValue.threads).toEqual([{ source: 'gitee', id: 'pull:12' }])
-    expect(threadKey(issueTriggerValue.threads[0]!)).toBe('gitee:issue:12')
-    expect(threadKey(pullTriggerValue.threads[0]!)).toBe('gitee:pull:12')
-    expect(threadIdOf('pull', 12)).toBe('pull:12')
-    expect(giteeRef('issue:12')).toEqual({ kind: 'issue', iid: 12 })
-    expect(giteeRef('pull:12')).toEqual({ kind: 'pull', iid: 12 })
+    expect(issueTriggerValue.threads).toEqual([{ source: 'gitee', id: `issue:12:${REPO}` }])
+    expect(pullTriggerValue.threads).toEqual([{ source: 'gitee', id: `pull:12:${REPO}` }])
+    expect(threadKey(issueTriggerValue.threads[0]!)).toBe(`gitee:issue:12:${REPO}`)
+    expect(threadKey(pullTriggerValue.threads[0]!)).toBe(`gitee:pull:12:${REPO}`)
+    expect(threadIdOf('pull', 12, REPO)).toBe(`pull:12:${REPO}`)
+    expect(giteeRef(`issue:12:${REPO}`)).toEqual({ kind: 'issue', iid: 12, repository: REPO })
+    expect(giteeRef(`pull:12:${REPO}`)).toEqual({ kind: 'pull', iid: 12, repository: REPO })
   })
   it('builds nothing for the agent\'s own issue, pull request or comment, nor for a bodyless comment', () => {
     expect(issueTrigger(topicOf('issue', 5, { author: 'agent' }), TARGET, 'agent')).toBeUndefined()
     expect(pullTrigger(topicOf('pull', 5, { author: 'agent' }), TARGET, 'agent')).toBeUndefined()
     const note: GiteeNoteView = { id: 9, author: 'agent', at: at('10:00:00'), text: 'On it' }
-    expect(noteTrigger(note, { kind: 'issue', iid: 5 }, TARGET, 'agent')).toBeUndefined()
-    expect(noteTrigger({ ...note, author: 'alice', text: '   ' }, { kind: 'issue', iid: 5 }, TARGET, 'agent')).toBeUndefined()
+    expect(noteTrigger(note, { kind: 'issue', iid: 5, repository: REPO }, TARGET, 'agent')).toBeUndefined()
+    expect(noteTrigger({ ...note, author: 'alice', text: '   ' }, { kind: 'issue', iid: 5, repository: REPO }, TARGET, 'agent')).toBeUndefined()
   })
   it('takes the actor from the account field and marks only a whole-handle mention', async () => {
     const h = host({}, { observeIssues: true })
@@ -151,10 +151,10 @@ describe('Gitee triggers', () => {
     expect(mentions('@AGENT please look', 'agent')).toBe(true)
     expect(mentions('mail@agent.dev is my address', 'agent')).toBe(false)
     const addressed = noteTrigger({ id: 1, author: 'bob', at: at('10:00:00'), text: '@agent please look' },
-      { kind: 'pull', iid: 3 }, TARGET, 'agent')!
+      { kind: 'pull', iid: 3, repository: REPO }, TARGET, 'agent')!
     expect(addressed.addressed).toBe('mention')
     const plain = noteTrigger({ id: 2, author: 'bob', at: at('10:00:00'), text: 'mail@agent.dev is my address' },
-      { kind: 'pull', iid: 3 }, TARGET, 'agent')!
+      { kind: 'pull', iid: 3, repository: REPO }, TARGET, 'agent')!
     expect(plain).not.toHaveProperty('addressed')
   })
   it('takes in an issue body and a mention from the feed, advances the cursor, and calls a replay a duplicate', async () => {
@@ -163,13 +163,13 @@ describe('Gitee triggers', () => {
     gitee(h, { 'GET /projects/:id/events': feed(all), 'GET /projects/:id/issues/7': issue,
       'GET /projects/:id/merge_requests/3': pull })
     expect(await pollRound(h, TARGET, 'agent')).toMatchObject({ events: 5, triggers: 2, dropped: 0 })
-    expect(h.receive.mock.calls.map(([trigger]) => trigger.id)).toEqual([key('gitee-issue', '7'), key('gitee-note', 'pull:3', '900')])
-    expect(h.receive.mock.calls[0]![0]).toMatchObject({ source: 'gitee', threads: [{ source: 'gitee', id: 'issue:7' }],
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.id)).toEqual([key('gitee-issue', REPO, '7'), key('gitee-note', threadIdOf('pull', 3, REPO), '900')])
+    expect(h.receive.mock.calls[0]![0]).toMatchObject({ source: 'gitee', threads: [{ source: 'gitee', id: `issue:7:${REPO}` }],
       actor: { source: 'gitee', id: 'alice' }, human: true, at: at('10:00:00'), text: 'Fix the margin\n\nThe margin is wrong',
-      meta: { kind: 'issue', on: 'issue', iid: 7, title: 'Fix the margin' } })
+      meta: { kind: 'issue', on: 'issue', iid: 7, repository: REPO, title: 'Fix the margin' } })
     expect(h.receive.mock.calls[1]![0]).toMatchObject({ actor: { source: 'gitee', id: 'bob' }, addressed: 'mention',
-      text: '@agent please look at this', meta: { kind: 'comment', on: 'pull', iid: 3, noteId: 900 } })
-    expect(h.store.get(KV.gitee.events)).toEqual({ since: at('13:00:00'),
+      text: '@agent please look at this', meta: { kind: 'comment', on: 'pull', iid: 3, repository: REPO, noteId: 900 } })
+    expect(h.store.get(KV.gitee.events)).toEqual({ repository: REPO, since: at('13:00:00'),
       started: { issue: at('09:00:00'), pull: at('09:00:00'), comment: at('09:00:00') } })
     const before = h.receive.mock.results.length
     await pollRound(h, TARGET, 'agent')
@@ -202,7 +202,7 @@ describe('Gitee triggers', () => {
       'GET /projects/:id/issues/7': commandError({ stderr: 'ERROR: 404 不存在', code: 1 }) })
     expect(await pollRound(stale, TARGET, 'agent')).toMatchObject({ triggers: 0, dropped: 1 })
     expect(stale.receive).not.toHaveBeenCalled()
-    expect(stale.store.get(KV.gitee.events)).toEqual({ since: at('10:00:00'),
+    expect(stale.store.get(KV.gitee.events)).toEqual({ repository: REPO, since: at('10:00:00'),
       started: { issue: at('09:00:00'), pull: at('09:00:00'), comment: at('09:00:00') } })
   })
   it('moves no cursor when the Source stops mid-round', async () => {
@@ -221,7 +221,7 @@ describe('Gitee triggers', () => {
     gitee(h, { 'GET /projects/:id/events': feed(all) })
     await pollRound(h, TARGET, 'agent')
     expect(h.receive).not.toHaveBeenCalled()
-    expect(h.store.get(KV.gitee.events)).toEqual({ since: at('13:00:00'),
+    expect(h.store.get(KV.gitee.events)).toEqual({ repository: REPO, since: at('13:00:00'),
       started: { issue: at('13:00:00'), pull: at('13:00:00'), comment: at('13:00:00') } })
     const [, args] = vi.mocked(h.commands.run).mock.calls[0]!
     expect(args.slice(0, 2)).toEqual(['GET', '/projects/:id/events'])
@@ -234,23 +234,59 @@ describe('Gitee triggers', () => {
     gitee(h, { 'GET /projects/:id/events': feed([events.issue]) })
     expect(await pollRound(h, TARGET, 'agent')).toMatchObject({ events: 1, triggers: 0, skipped: 1 })
     expect(h.receive).not.toHaveBeenCalled()
-    expect(h.store.get(KV.gitee.events)).toEqual({ since: at('10:00:00'),
+    expect(h.store.get(KV.gitee.events)).toEqual({ repository: REPO, since: at('10:00:00'),
       started: { issue: floor, pull: floor, comment: floor } })
   })
   it('polls a subscribed issue Thread through its discussion notes once, then calls the newest note a duplicate', async () => {
     const h = host()
     seed(h, at('09:00:00'))
-    h.store.threads.save({ key: 'gitee:issue:7', ref: { source: 'gitee', id: 'issue:7' }, createdAt: at('10:00:00'),
-      lastAt: new Date().toISOString(), subscriptions: ['t1'], correlated: [], pending: [], meta: { kind: 'issue', iid: 7 } })
+    h.store.threads.save({ key: `gitee:issue:7:${REPO}`, ref: { source: 'gitee', id: `issue:7:${REPO}` }, createdAt: at('10:00:00'),
+      lastAt: new Date().toISOString(), subscriptions: ['t1'], correlated: [], pending: [], meta: { kind: 'issue', iid: 7, repository: REPO } })
     gitee(h, { 'GET /projects/:id/events': feed([]), 'GET /projects/:id/issues/7/discussions': discussionsWithMine })
     await pollRound(h, TARGET, 'agent')
     expect(h.receive.mock.calls.map(([trigger]) => [trigger.actor.id, trigger.text]))
       .toEqual([['carol', 'First look'], ['dave', 'A reply from dave']])
-    expect(h.store.get(KV.gitee.read('issue:7'))).toBe(at('10:11:00'))
+    expect(h.store.get(KV.gitee.read(`issue:7:${REPO}`))).toBe(at('10:11:00'))
     const before = h.receive.mock.results.length
     await pollRound(h, TARGET, 'agent')
     expect(h.receive.mock.calls.length).toBe(before + 1)
     expect(await h.receive.mock.results.at(-1)!.value).toBe('duplicate')
+  })
+  it('keeps two repositories apart when the repository setting changes', async () => {
+    const h = host({}, { observeIssues: true })
+    seed(h, at('09:00:00'))
+    gitee(h, { 'GET /projects/:id/events': feed([events.issue]), 'GET /projects/:id/issues/7': issue })
+    await pollRound(h, TARGET, 'agent')
+    expect(await h.receive.mock.results[0]!.value).toBe('stored')
+    const first = h.receive.mock.calls[0]![0]
+    // The operator points the Source at a repository whose issues are numbered independently.
+    h.store.saveSettings(SettingsSchema.parse({ sources: { gitee: { enabled: true,
+      config: { repository: 'klx/other/repo', cli: 'klx-api.sh', observeIssues: true } } },
+      policy: { sources: { gitee: { allowed: [{ id: 'alice' }] } } }, eval: { mode: 'auto' } }))
+    const other = { cli: 'klx-api.sh', repository: 'klx/other/repo' }
+    gitee(h, { 'GET /projects/:id/events': feed([events.issue]), 'GET /projects/:id/issues/7': issue })
+    // Its first poll baselines that repository's feed instead of reading history, so nothing is taken in yet.
+    await pollRound(h, other, 'agent')
+    const later = { ...events.issue, id: 201, created_at: at('14:00:00') }
+    gitee(h, { 'GET /projects/:id/events': feed([events.issue, later]), 'GET /projects/:id/issues/7': issue })
+    await pollRound(h, other, 'agent')
+    expect(await h.receive.mock.results.at(-1)!.value).toBe('stored')
+    expect(h.receive.mock.calls.at(-1)![0].threads[0]).not.toEqual(first.threads[0])
+  })
+  it('reads a subscribed Thread against the repository it came from, not the current setting', async () => {
+    const h = host()
+    seed(h, at('09:00:00'), at('09:00:00'), 'klx/other/repo')
+    h.store.threads.save({ key: `gitee:issue:7:${REPO}`, ref: { source: 'gitee', id: `issue:7:${REPO}` }, createdAt: at('10:00:00'),
+      lastAt: new Date().toISOString(), subscriptions: ['t1'], correlated: [], pending: [],
+      meta: { kind: 'issue', iid: 7, repository: REPO } })
+    h.store.saveSettings(SettingsSchema.parse({ sources: { gitee: { enabled: true,
+      config: { repository: 'klx/other/repo', cli: 'klx-api.sh' } } },
+      policy: { sources: { gitee: { allowed: [{ id: 'alice' }] } } }, eval: { mode: 'auto' } }))
+    gitee(h, { 'GET /projects/:id/events': feed([]), 'GET /projects/:id/issues/7/discussions': discussions })
+    await pollRound(h, { cli: 'klx-api.sh', repository: 'klx/other/repo' }, 'agent')
+    const call = vi.mocked(h.commands.run).mock.calls.find(([, args]) => args[1]!.endsWith('/discussions'))
+    expect(call![1]).toContain(REPO)
+    expect(call![1]).not.toContain('klx/other/repo')
   })
 })
 
@@ -282,6 +318,16 @@ describe('Gitee channel', () => {
     expect(bodyOf(h, 'POST /projects/:id/merge_requests/3/notes'))
       .toEqual({ note: 'Done\n\n<!-- dsh-superagent:m3 -->', noteable_type: 'PullRequest' })
   })
+  it('formats a reply timestamp on the platform clock, not on the deployment clock', async () => {
+    expect(giteeTimestamp(new Date('2026-01-01T00:00:00Z'))).toBe('2026-01-01 08:00:00')
+    const h = host()
+    gitee(h, { 'GET /user': ME, 'GET /projects/:id/issues/7/discussions': [],
+      'POST /projects/:id/issues/7/notes': { message: '添加成功', code: 0 } })
+    await sendGitee({ commands: h.commands }, reply('m9', giteeChannel('issue', 7, TARGET)))
+    const body = bodyOf(h, 'POST /projects/:id/issues/7/notes') as { created_at: string }
+    // The platform reads a naive timestamp as +08:00, so the value must round-trip to the moment it was written.
+    expect(Math.abs(giteeTime(body.created_at) - Date.now())).toBeLessThan(120_000)
+  })
   it('drops a confirmed dead destination and keeps a bare 404 for a retry', async () => {
     const h = host()
     gitee(h, { 'GET /user': ME, 'GET /projects/:id/issues/7/discussions': [],
@@ -300,7 +346,7 @@ describe('Gitee context and kind', () => {
     const h = host()
     gitee(h, { 'GET /projects/:id/issues/7': issue, 'GET /projects/:id/issues/7/discussions': discussions })
     const trigger = noteTrigger({ id: 56, author: 'dave', at: at('10:11:00'), text: 'A reply from dave', parent: 55 },
-      { kind: 'issue', iid: 7 }, TARGET, 'agent')!
+      { kind: 'issue', iid: 7, repository: REPO }, TARGET, 'agent')!
     expect(giteeThreadContext.messageId(trigger)).toBe('56')
     const thread = await giteeThreadContext.read(h.commands, trigger, 'thread', undefined, {})
     expect(thread.messages.map(message => message.id)).toEqual(['topic:7', '55', '56'])
@@ -323,9 +369,9 @@ describe('Gitee context and kind', () => {
         ['comment', { listedUnaddressed: true, unlistedAddressed: true, unlistedUnaddressed: true }]])
     const h = host()
     const trigger = noteTrigger({ id: 900, author: 'alice', at: at('12:00:00'), text: '@agent please look' },
-      { kind: 'issue', iid: 7 }, TARGET, 'agent')!
+      { kind: 'issue', iid: 7, repository: REPO }, TARGET, 'agent')!
     expect(await h.receive(trigger)).toBe('stored')
-    expect(h.store.threads.get('gitee:issue:7')?.evaluating).toMatchObject({ strength: 'explicit',
+    expect(h.store.threads.get(`gitee:issue:7:${REPO}`)?.evaluating).toMatchObject({ strength: 'explicit',
       actor: { source: 'gitee', id: 'alice' }, basis: expect.objectContaining({ via: 'addressed', addressed: 'mention' }) })
   })
   it('fills its environment variables for a Gitee Trigger and leaves them empty for a Feishu one', () => {
@@ -335,7 +381,7 @@ describe('Gitee context and kind', () => {
       DSH_SUPERAGENT_GITEE_REPOSITORY: REPO, DSH_SUPERAGENT_GITEE_KIND: 'issue', DSH_SUPERAGENT_GITEE_IID: '7' })
     // The kind names the item a comment sits on, not the fact that it is a comment.
     const comment = noteTrigger({ id: 900, author: 'bob', at: at('12:00:00'), text: 'hi' },
-      { kind: 'pull', iid: 3 }, TARGET, 'agent')!
+      { kind: 'pull', iid: 3, repository: REPO }, TARGET, 'agent')!
     expect(giteeKind.environment!.values({ deployment: testDeployment(), config, trigger: comment })).toEqual({
       DSH_SUPERAGENT_GITEE_REPOSITORY: REPO, DSH_SUPERAGENT_GITEE_KIND: 'pull', DSH_SUPERAGENT_GITEE_IID: '3' })
     const feishu = feishuTrigger({ message_id: 'om_1', chat_id: 'oc_1', chat_type: 'group', sender_id: 'ou_alice',

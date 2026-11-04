@@ -24,7 +24,7 @@ export async function sendGitee(host: Pick<SourceContext, 'commands'>, message: 
     throw new Error('Missing Gitee reply target')
   }
   const target: GiteeTarget = { cli, repository }
-  const ref: GiteeRef = { kind: on, iid }
+  const ref: GiteeRef = { kind: on, iid, repository }
   const marker = `<!-- dsh-superagent:${message.id} -->`
   try {
     const me = await giteeMe(commands, target)

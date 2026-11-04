@@ -56,7 +56,7 @@ export const giteeKind: SourceKind<GiteeConfig> = {
   },
   channel: { allowed: giteeAllowed, send: sendGitee, link: giteeLink },
   threadContext: giteeThreadContext,
-  find: giteeFind,
+  find: (query, config) => giteeFind(query, config),
   policy: {
     schema: z.object({ allowed: z.array(z.object({ id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/), name: z.string().trim().max(100).optional() }).strict())
       .refine(accounts => new Set(accounts.map(account => account.id.toLowerCase())).size === accounts.length, 'Duplicate accounts').default([]) }).strict(),
@@ -153,17 +153,19 @@ Promise<{ events: number; triggers: number; dropped: number; skipped: number }> 
  */
 export async function pollEvents(ctx: SourceContext, target: GiteeTarget, me: string, round: Round): Promise<void> {
   const commands = ctx.commands.withSignal(round.signal)
+  const config = ctx.config<GiteeConfig>(SOURCE)
+  if (!config) throw new Error('The Gitee Source stopped during the poll')
   const stored = ctx.state.get(KV.gitee.events)
-  // The first poll records the newest event as every kind's floor and takes nothing in, so a new Source never replays history.
-  if (!stored) {
+  // The first poll of a repository records its newest event as every kind's floor and takes nothing in, so a new Source
+  // never replays history. Pointing the Source at another repository starts its own window the same way, because a
+  // cursor of one repository's feed says nothing about another's.
+  if (!stored || stored.repository !== config.repository) {
     const newest = eventsOf(await commands.gitee(target, EventListSchema, '/projects/:id/events',
       { query: { type: 'all', sort: 'desc', per_page: 1 } })).at(0)
     const since = newest?.created_at ?? ''
-    ctx.state.set(KV.gitee.events, { since, started: { issue: since, pull: since, comment: since } })
+    ctx.state.set(KV.gitee.events, { repository: config.repository, since, started: { issue: since, pull: since, comment: since } })
     return
   }
-  const config = ctx.config<GiteeConfig>(SOURCE)
-  if (!config) throw new Error('The Gitee Source stopped during the poll')
   let newest = ''
   for (let page = 1; page <= MAX_PAGES; page += 1) {
     if (stopped(ctx, round)) throw new Error('The Gitee Source stopped during the poll')
@@ -185,11 +187,11 @@ export async function pollEvents(ctx: SourceContext, target: GiteeTarget, me: st
       let title = ''
       let url: string | undefined
       if (outcome.activity === 'comment') {
-        trigger = noteTrigger(outcome.note, { kind: outcome.on, iid: outcome.iid }, target, me)
+        trigger = noteTrigger(outcome.note, { kind: outcome.on, iid: outcome.iid, repository: target.repository }, target, me)
         title = (event.target_title ?? '').trim()
         url = event.merge_request_data?.web_url ?? undefined
       } else {
-        const ref: GiteeRef = { kind: outcome.activity, iid: outcome.iid }
+        const ref: GiteeRef = { kind: outcome.activity, iid: outcome.iid, repository: target.repository }
         try {
           const topic = await readTopic(commands, target, ref, { at: event.created_at, author: (event.author_username ?? '').trim(),
             ...outcome.title ? { title: outcome.title } : {} })
@@ -209,7 +211,7 @@ export async function pollEvents(ctx: SourceContext, target: GiteeTarget, me: st
       await ctx.receive(trigger)
       round.triggers += 1
       const kind = outcome.activity === 'comment' ? outcome.on : outcome.activity
-      ctx.threads.describe(threadKey({ source: SOURCE, id: threadIdOf(kind, outcome.iid) }),
+      ctx.threads.describe(threadKey({ source: SOURCE, id: threadIdOf(kind, outcome.iid, target.repository) }),
         { label: threadLabel(kind, outcome.iid, title), ...(url ? { url } : {}) })
     }
     if (events.length < PAGE_SIZE) break
@@ -218,7 +220,7 @@ export async function pollEvents(ctx: SourceContext, target: GiteeTarget, me: st
   // It never moves backwards, so an overlapping read that returned only events already taken in cannot make the next
   // round re-read the whole window.
   if (round.events && (!stored.since || giteeTime(newest) > giteeTime(stored.since))) {
-    ctx.state.set(KV.gitee.events, { since: newest, started: stored.started })
+    ctx.state.set(KV.gitee.events, { repository: stored.repository, since: newest, started: stored.started })
   }
 }
 /** Polls subscribed Threads for comments newer than each Thread's checkpoint; item creation itself is the feed's business. */
@@ -226,15 +228,18 @@ export async function pollThreads(ctx: SourceContext, target: GiteeTarget, me: s
   await pollEach(ctx, SOURCE, () => stopped(ctx, round), async thread => {
     const ref = giteeRef(thread.ref.id)
     if (!ref) throw new Error(`Subscribed Gitee Thread ${thread.ref.id} names no issue or pull request`)
+    // A Thread is read against the repository it was created from, so a changed setting cannot make it read
+    // another repository's item with the same number.
+    const own: GiteeTarget = { cli: target.cli, repository: ref.repository }
     const checkpoint = KV.gitee.read(thread.ref.id)
     const since = ctx.state.get(checkpoint) ?? thread.createdAt
     const floor = giteeTime(since)
-    const notes = await readNotes(ctx.commands.withSignal(round.signal), target, ref)
+    const notes = await readNotes(ctx.commands.withSignal(round.signal), own, ref)
     for (const note of notes) {
       if (stopped(ctx, round)) throw new Error('The Gitee Source stopped during the poll')
       // A comment's `created_at` is its only clock: an edit is out of scope and neither replays a note nor hides one.
       if (!(giteeTime(note.at) >= floor)) continue
-      const trigger = noteTrigger(note, ref, target, me)
+      const trigger = noteTrigger(note, ref, own, me)
       if (!trigger) continue
       await ctx.receive(trigger)
       round.triggers += 1

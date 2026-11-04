@@ -5,9 +5,9 @@ import type { GiteeTarget } from '../infra/commands.ts'
 import { escapeRegExp, sameName } from '../infra/text.ts'
 
 export const SOURCE = 'gitee'
-/** Gitee numbers issues and pull requests in separate spaces, so every id carries the kind it belongs to. */
+/** Gitee numbers issues and pull requests in separate spaces, and numbers them again per repository, so a reference names both. */
 export type GiteeKind = 'issue' | 'pull'
-export interface GiteeRef { kind: GiteeKind; iid: number }
+export interface GiteeRef { kind: GiteeKind; iid: number; repository: string }
 /** An issue or pull request as the readers hand it to the builders. */
 export interface GiteeTopic { kind: GiteeKind; iid: number; title: string; text: string; at: string; author: string; url?: string }
 export interface GiteeNoteView { id: number; author: string; at: string; text: string; parent?: number }
@@ -67,26 +67,28 @@ export const DiscussionListSchema = z.union([z.array(DiscussionSchema), z.looseO
 export const discussionsOf = (page: z.infer<typeof DiscussionListSchema>): z.infer<typeof DiscussionSchema>[] =>
   Array.isArray(page) ? page : page.list
 
-/** The Thread id of an item: `issue:12` or `pull:34`. */
-export const threadIdOf = (kind: GiteeKind, iid: number): string => `${kind}:${iid}`
+/** The Thread id of an item: `issue:12:klx/group/repo`. The repository is part of it because two repositories number their issues and pull requests independently. */
+export const threadIdOf = (kind: GiteeKind, iid: number, repository: string): string => `${kind}:${iid}:${repository}`
 /** The item kind a platform `target_type` names; undefined for pushes, projects and other events. */
 const kindOf = (target: string): GiteeKind | undefined =>
   target === 'issue' ? 'issue' : target === 'pull_request' || target === 'pull' || target === 'merge_request' ? 'pull' : undefined
 /** The inverse of {@link threadIdOf}, for a stored Thread id; undefined for anything else. */
 export function giteeRef(id: string): GiteeRef | undefined {
-  const match = /^(issue|pull):([1-9]\d*)$/.exec(id)
+  const match = /^(issue|pull):([1-9]\d*):(.+)$/.exec(id)
   if (!match) return undefined
   const kind = kindOf(match[1]!)
-  return kind ? { kind, iid: Number(match[2]!) } : undefined
+  const repository = match[3]!.trim()
+  return kind && repository ? { kind, iid: Number(match[2]!), repository } : undefined
 }
 /** The item a Trigger sits on, read from `meta`; throws when `meta` names none. */
 export function refOf(trigger: Trigger): GiteeRef {
-  const { on, iid } = trigger.meta
+  const { on, iid, repository } = trigger.meta
   const kind = on === 'issue' || on === 'pull' ? on : undefined
-  if (!kind || typeof iid !== 'number' || !Number.isInteger(iid) || iid <= 0) {
+  if (!kind || typeof iid !== 'number' || !Number.isInteger(iid) || iid <= 0
+    || typeof repository !== 'string' || !repository.trim()) {
     throw new Error('The Gitee Trigger names no issue or pull request')
   }
-  return { kind, iid }
+  return { kind, iid, repository: repository.trim() }
 }
 /** Whole-handle, case-insensitive mention match on `@username`; not inside a word or an email. */
 export const mentions = (text: string, username: string): boolean => {
@@ -98,7 +100,7 @@ export const isMe = (author: string, me: string): boolean =>
   !!author.trim() && !!me.trim() && sameName(author.trim(), me.trim())
 /** The reply address of an item. It carries the CLI and repository because `channel.send` cannot see config. */
 export const giteeChannel = (kind: GiteeKind, iid: number, target: GiteeTarget, url?: string): ChannelRef =>
-  ({ source: SOURCE, thread: `${SOURCE}:${threadIdOf(kind, iid)}`,
+  ({ source: SOURCE, thread: `${SOURCE}:${threadIdOf(kind, iid, target.repository)}`,
     address: { on: kind, iid: String(iid), repository: target.repository, cli: target.cli, ...(url ? { url } : {}) } })
 /** An item's model-facing text: its title, then its description, without a blank line when the description is empty. */
 export const topicText = (topic: Pick<GiteeTopic, 'title' | 'text'>): string =>
@@ -107,22 +109,28 @@ export const topicText = (topic: Pick<GiteeTopic, 'title' | 'text'>): string =>
 /**
  * `#12` names the issue Thread, `!12` the pull Thread, a bare number both. Ident and web URLs become search terms.
  * A bare number is no ident, so it adds no term: it would match every Trigger that mentions the number.
+ * The repository comes from the Source's configuration, because it is part of a Thread id; without one, a number
+ * names no Thread at all.
  */
-export function giteeFind(query: string): { threads: string[]; terms: string[] } {
+export function giteeFind(query: string, config?: { repository?: string }): { threads: string[]; terms: string[] } {
+  const repository = (config?.repository ?? '').trim()
   const value = query.trim()
   // Any host, because the platform is an internal deployment; the number a web URL carries is read as the iid.
   const page = /^(https?:\/\/\S*?\/(issues|pulls?)\/(\d+))\/?(?:[?#].*)?$/i.exec(value)
   if (page) {
+    // A URL of another repository names no Thread here, so it stays a search term only.
+    if (!repository || !page[1]!.includes(repository)) return { threads: [], terms: [page[1]!] }
     const kind: GiteeKind = page[2]!.toLowerCase() === 'issues' ? 'issue' : 'pull'
-    return { threads: [threadOf(kind, Number(page[3]!))], terms: [page[1]!] }
+    return { threads: [threadOf(kind, Number(page[3]!), repository)], terms: [page[1]!] }
   }
   const ident = /^([#!]?)([1-9]\d*)$/.exec(value)
-  if (!ident) return { threads: [], terms: [] }
+  if (!ident || !repository) return { threads: [], terms: [] }
   const kinds: GiteeKind[] = ident[1] === '#' ? ['issue'] : ident[1] === '!' ? ['pull'] : ['issue', 'pull']
-  return { threads: kinds.map(kind => threadOf(kind, Number(ident[2]!))),
+  return { threads: kinds.map(kind => threadOf(kind, Number(ident[2]!), repository)),
     terms: ident[1] ? [`${ident[1]}${ident[2]!}`] : [] }
 }
-const threadOf = (kind: GiteeKind, iid: number): string => threadKey({ source: SOURCE, id: threadIdOf(kind, iid) })
+const threadOf = (kind: GiteeKind, iid: number, repository: string): string =>
+  threadKey({ source: SOURCE, id: threadIdOf(kind, iid, repository) })
 
 /** Trigger id namespaces of an item's own body. */
 const TOPIC_KEY: Record<GiteeKind, string> = { issue: 'gitee-issue', pull: 'gitee-pull' }
@@ -130,11 +138,11 @@ function topicTrigger(kind: GiteeKind, topic: GiteeTopic, target: GiteeTarget, m
   if (isMe(topic.author, me)) return undefined
   const text = topicText(topic)
   if (!text.trim()) return undefined
-  return { id: key(TOPIC_KEY[kind], String(topic.iid)), source: SOURCE,
-    threads: [{ source: SOURCE, id: threadIdOf(kind, topic.iid) }], actor: { source: SOURCE, id: topic.author },
+  return { id: key(TOPIC_KEY[kind], target.repository, String(topic.iid)), source: SOURCE,
+    threads: [{ source: SOURCE, id: threadIdOf(kind, topic.iid, target.repository) }], actor: { source: SOURCE, id: topic.author },
     human: !isMe(topic.author, me), ...(mentions(text, me) ? { addressed: 'mention' as const } : {}), at: topic.at, text,
     channel: giteeChannel(kind, topic.iid, target, topic.url), ...(topic.url ? { url: topic.url } : {}),
-    meta: { kind, on: kind, iid: topic.iid, title: topic.title } }
+    meta: { kind, on: kind, iid: topic.iid, repository: target.repository, title: topic.title } }
 }
 /** Builds the Trigger of a newly opened issue's title and description; none for the agent's own issue or an empty one. */
 export const issueTrigger = (topic: GiteeTopic, target: GiteeTarget, me: string): Trigger | undefined =>
@@ -150,11 +158,12 @@ export const pullTrigger = (topic: GiteeTopic, target: GiteeTarget, me: string):
 export function noteTrigger(note: GiteeNoteView, ref: GiteeRef, target: GiteeTarget, me: string, url?: string): Trigger | undefined {
   if (isMe(note.author, me)) return undefined
   if (!note.text.trim()) return undefined
-  return { id: key('gitee-note', threadIdOf(ref.kind, ref.iid), String(note.id)), source: SOURCE,
-    threads: [{ source: SOURCE, id: threadIdOf(ref.kind, ref.iid) }], actor: { source: SOURCE, id: note.author },
+  return { id: key('gitee-note', threadIdOf(ref.kind, ref.iid, ref.repository), String(note.id)), source: SOURCE,
+    threads: [{ source: SOURCE, id: threadIdOf(ref.kind, ref.iid, ref.repository) }], actor: { source: SOURCE, id: note.author },
     human: !isMe(note.author, me), ...(mentions(note.text, me) ? { addressed: 'mention' as const } : {}),
     at: note.at, text: note.text, channel: giteeChannel(ref.kind, ref.iid, target, url), ...(url ? { url } : {}),
-    meta: { kind: 'comment', on: ref.kind, iid: ref.iid, noteId: note.id, ...(note.parent ? { replyTo: note.parent } : {}) } }
+    meta: { kind: 'comment', on: ref.kind, iid: ref.iid, repository: ref.repository, noteId: note.id,
+      ...(note.parent ? { replyTo: note.parent } : {}) } }
 }
 
 /** What one event asks for: an issue body, a pull body, a comment, or nothing. */

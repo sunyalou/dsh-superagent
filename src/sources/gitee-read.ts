@@ -19,8 +19,16 @@ export function giteeTime(value: string): number {
   const zone = (offset ?? '+08:00').replace(/^([+-]\d{2})(\d{2})$/, '$1:$2')
   return Date.parse(`${year}-${month}-${day}T${hour}:${minute}:${second}.${(fraction + '000').slice(0, 3)}${zone}`)
 }
-/** The timestamp a new issue comment carries: local `YYYY-MM-DD HH:MM:SS`, which the platform takes as `+08:00`. */
-export const giteeNow = (): string => new Date().toLocaleString('sv-SE', { hour12: false }).slice(0, 19)
+/**
+ * The platform's wall clock for a new issue comment: `YYYY-MM-DD HH:MM:SS`. It reads a naive timestamp as `+08:00`,
+ * so the value is formatted in that zone rather than in the deployment's, which may be anywhere.
+ */
+export function giteeTimestamp(at: Date): string {
+  return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', hour12: false, year: 'numeric', month: '2-digit',
+    day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(at).slice(0, 19)
+}
+/** The timestamp a new issue comment carries. */
+export const giteeNow = (): string => giteeTimestamp(new Date())
 
 /** Reads an issue or pull request's title and description; a PR also yields its `web_url`. */
 export async function readTopic(commands: Commands, target: GiteeTarget, ref: GiteeRef,
