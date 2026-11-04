@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
-import { CliError, Commands, commandError } from '../src/infra/commands.ts'
+import { CliError, Commands, commandError, giteeError } from '../src/infra/commands.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { feishuChannel } from '../src/sources/feishu-trigger.ts'
 import { githubKind } from '../src/sources/github.ts'
@@ -212,4 +212,37 @@ it('stops a running command when the signal of its work aborts, or the lifetime,
   lifetime.abort()
   await expect(other).rejects.toThrow()
   expect(Date.now() - started).toBeLessThan(4000)
+})
+
+describe('Gitee calls', () => {
+  const target = { cli: '/path/klx-api.sh', repository: 'klx/group/repo' }
+  const commands = () => new Commands(() => deployment, {}, new AbortController().signal)
+  it('build a call from method, path, repository, query and body, and parse the JSON stdout', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockResolvedValue('{"iid":7,"title":"Fix the margin"}')
+    expect(await value.gitee(target, z.looseObject({ iid: z.number() }), '/projects/:id/issues/7',
+      { method: 'POST', query: { page: 2 }, body: { body: 'hi' } })).toEqual({ iid: 7, title: 'Fix the margin' })
+    expect(run).toHaveBeenLastCalledWith('/path/klx-api.sh',
+      ['POST', '/projects/:id/issues/7', '-r', 'klx/group/repo', '-q', 'page=2', '-d', '{"body":"hi"}'])
+    // The agent's identity is not repository-scoped, so /user carries no -r.
+    run.mockResolvedValue('{"id":1,"username":"agent"}')
+    expect(await value.gitee(target, z.looseObject({ username: z.string() }), '/user')).toEqual({ id: 1, username: 'agent' })
+    expect(run).toHaveBeenLastCalledWith('/path/klx-api.sh', ['GET', '/user'])
+    // An endpoint that answers nothing still validates, as null.
+    run.mockResolvedValue('')
+    expect(await value.gitee(target, z.unknown(), '/user')).toBeNull()
+  })
+  it('refuse a path outside the configured repository and a call with no repository', async () => {
+    const value = commands()
+    for (const path of ['/projects/x/issues/7', '/groups/1', 'projects/:id/issues/7']) {
+      await expect(value.gitee(target, z.unknown(), path)).rejects.toThrow('restricted to the configured repository')
+    }
+    await expect(value.gitee({ ...target, repository: '' }, z.unknown(), '/projects/:id/issues/7'))
+      .rejects.toThrow('The Gitee Source has no repository')
+  })
+  it('map the HTTP status the toolkit names, leaving a network failure transient', () => {
+    expect(giteeError(commandError({ stderr: 'ERROR: 404 不存在', code: 1 }))).toMatchObject({ code: 404, exitCode: 1 })
+    expect(giteeError(commandError({ stderr: 'ERROR: 000 connection refused', code: 1 }))).toMatchObject({ code: undefined })
+    expect(giteeError(commandError({ code: 1 }))).toMatchObject({ code: undefined })
+  })
 })

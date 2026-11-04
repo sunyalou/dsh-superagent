@@ -46,6 +46,19 @@ export function validItems<T>(item: z.ZodType<T>, list: readonly unknown[], tall
   if (tally) tally.skipped += list.length - items.length
   return items
 }
+/** What a Gitee Source calls through: the toolkit's CLI command and the repository it is pinned to. */
+export interface GiteeTarget { cli: string; repository: string }
+/** One Gitee call: the method, query values the CLI encodes once each, and an optional JSON body. */
+export interface GiteeCall { method?: 'GET' | 'POST' | 'PUT' | 'DELETE'; query?: Record<string, string | number>; body?: unknown }
+/**
+ * Maps the toolkit's failure to a CliError whose `code` is the HTTP status its diagnostics name.
+ * klx-api.sh prints `ERROR: <code> ...` on stderr; a network failure prints `000`, which stays undefined (transient).
+ */
+export function giteeError(error: unknown): Error {
+  if (!(error instanceof CliError)) return error instanceof Error ? error : new Error(String(error))
+  const status = Number(/\bERROR:\s*(\d{3})\b/.exec(error.message)?.[1])
+  return new CliError(error.message, status >= 100 ? status : undefined, error.exitCode)
+}
 /** Rewrites Feishu error 232011 (bot not in chat) with remediation instructions. */
 function membership(error: unknown): unknown {
   if (!(error instanceof CliError) || error.code !== 232011) return error
@@ -68,7 +81,7 @@ export class Commands {
   async run(program: string, args: string[], cwd?: string): Promise<string> {
     try {
       const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1', KLX_GITEE_NO_PROMPT: '1' } })
       return stdout
     } catch (error) { throw commandError(error, program) }
   }
@@ -109,6 +122,20 @@ export class Commands {
     const code = result.error?.code
     if (!result.ok) throw membership(new CliError(`${result.error?.message ?? 'Feishu command failed'}${code ? ` (${code})` : ''}`, code))
     return result.data
+  }
+  /**
+   * Calls the Gitee toolkit (`klx-api.sh`) on `path` and parses the `data` it prints with `schema`.
+   * Restricted to the configured repository, plus `GET /user` for the agent's own identity.
+   * @throws CliError whose `code` is the HTTP status the toolkit named, undefined when it named none.
+   */
+  async gitee<T>(target: GiteeTarget, schema: z.ZodType<T>, path: string, call: GiteeCall = {}): Promise<T> {
+    if (path !== '/user' && !path.startsWith('/projects/:id/')) throw new Error('Gitee calls are restricted to the configured repository')
+    if (!target.repository) throw new Error('The Gitee Source has no repository')
+    const query = Object.entries(call.query ?? {}).flatMap(([name, value]) => ['-q', `${name}=${value}`])
+    const args = [call.method ?? 'GET', path, ...path === '/user' ? [] : ['-r', target.repository], ...query,
+      ...call.body === undefined ? [] : ['-d', JSON.stringify(call.body)]]
+    const output = await this.run(target.cli, args).catch((error: unknown) => { throw giteeError(error) })
+    return schema.parse(output.trim() ? JSON.parse(output) : null)
   }
   /** Runs `git` on PATH using the agent's isolated git environment and credential helper. */
   async git(args: string[], cwd: string): Promise<string> { return this.run('git', args, cwd) }
