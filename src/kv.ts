@@ -55,4 +55,10 @@ export const KV = {
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
+  /**
+   * Gitee Source: the events feed's window (`since` is the newest `created_at` taken in) and the per-kind replay floor
+   * (`started`, set at bootstrap so a switch turned on later never replays backlog), plus per-Thread read checkpoints.
+   */
+  gitee: { events: record<{ since: string; started: Record<string, string> }>('gitee-events'),
+    read: family<string, [thread: string]>('gitee-read:') },
 }
